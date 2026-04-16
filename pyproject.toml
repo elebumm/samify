@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "samify"
-version = "0.2.0"
+version = "0.3.0"
 description = "Text-prompted video segmentation CLI — SAM 3 via cloud API (Replicate/fal.ai) or local GPU, output ProRes 4444 RGBA."
 requires-python = ">=3.10"
 readme = "README.md"
@@ -13,6 +13,7 @@ dependencies = [
     "replicate>=1.0",
     "requests>=2.31",
     "pillow>=10",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

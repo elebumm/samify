@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -70,6 +71,41 @@ def probe(input_path: Path) -> dict:
     }
 
 
+def _build_mask_filter(
+    feather: int = 0,
+    dilate: int = 0,
+    erode: int = 0,
+    threshold: int = 0,
+    invert: bool = False,
+) -> str:
+    """Build the mask processing filter chain inserted between scale2ref and alphamerge."""
+    steps = ["format=gray"]
+
+    # Morphological operations (applied to mask before feathering).
+    if erode > 0:
+        for _ in range(erode):
+            steps.append("erosion")
+    if dilate > 0:
+        for _ in range(dilate):
+            steps.append("dilation")
+
+    # Threshold: binarize at a specific value.
+    if threshold > 0:
+        steps.append(f"lutrgb=r='if(val,if(gt(val,{threshold}),255,0),0)'"
+                      f":g='if(val,if(gt(val,{threshold}),255,0),0)'"
+                      f":b='if(val,if(gt(val,{threshold}),255,0),0)'")
+
+    # Feather (gaussian blur on mask edges).
+    if feather > 0:
+        steps.append(f"gblur=sigma={feather / 2:.3f}")
+
+    # Invert mask.
+    if invert:
+        steps.append("negate")
+
+    return ",".join(steps)
+
+
 def compose_rgba_mov(
     original: Path,
     mask_video: Path,
@@ -78,6 +114,10 @@ def compose_rgba_mov(
     keep_audio: bool = True,
     feather: int = 0,
     fps: float | None = None,
+    dilate: int = 0,
+    erode: int = 0,
+    threshold: int = 0,
+    invert: bool = False,
 ) -> None:
     """Composite original (RGB) + mask (B/W) into ProRes 4444 RGBA .mov.
 
@@ -87,14 +127,8 @@ def compose_rgba_mov(
     """
     ffmpeg = _require_ffmpeg()
 
-    # Some SAM providers (Replicate's cog wrapper in particular) re-encode
-    # the mask mp4 with imageio/libx264, which can pad dimensions to an even
-    # multiple (480x270 -> 480x272). Force the mask stream to match the
-    # reference video's dimensions before alphamerge. Nearest-neighbor
-    # preserves mask sharpness; the optional feather re-softens the edge.
-    feather_step = (
-        f",gblur=sigma={feather / 2:.3f}" if feather > 0 else ""
-    )
+    mask_filter = _build_mask_filter(feather, dilate, erode, threshold, invert)
+
     # setpts=PTS-STARTPTS on both streams so alphamerge doesn't drop frames
     # when the mask's container has a different start-time than the source.
     # scale2ref handles the Replicate mod-16 padding (e.g. 480x270 -> 480x272).
@@ -102,7 +136,7 @@ def compose_rgba_mov(
         f"[0:v]setpts=PTS-STARTPTS[vref];"
         f"[1:v]setpts=PTS-STARTPTS[mref];"
         f"[mref][vref]scale2ref=flags=neighbor[m0][v];"
-        f"[m0]format=gray{feather_step}[m];"
+        f"[m0]{mask_filter}[m];"
         f"[v][m]alphamerge,format=yuva444p10le[out]"
     )
 
@@ -111,6 +145,7 @@ def compose_rgba_mov(
         "-y",
         "-loglevel",
         "error",
+        "-stats",
         "-i",
         str(original),
         "-i",
@@ -150,6 +185,125 @@ def compose_rgba_mov(
     subprocess.run(cmd, check=True)
 
 
+def compose_rgba_webm(
+    original: Path,
+    mask_video: Path,
+    output: Path,
+    *,
+    keep_audio: bool = True,
+    feather: int = 0,
+    fps: float | None = None,
+    dilate: int = 0,
+    erode: int = 0,
+    threshold: int = 0,
+    invert: bool = False,
+) -> None:
+    """Composite original (RGB) + mask (B/W) into VP9+alpha WebM."""
+    ffmpeg = _require_ffmpeg()
+
+    mask_filter = _build_mask_filter(feather, dilate, erode, threshold, invert)
+
+    filter_complex = (
+        f"[0:v]setpts=PTS-STARTPTS[vref];"
+        f"[1:v]setpts=PTS-STARTPTS[mref];"
+        f"[mref][vref]scale2ref=flags=neighbor[m0][v];"
+        f"[m0]{mask_filter}[m];"
+        f"[v][m]alphamerge,format=yuva420p[out]"
+    )
+
+    if fps is None:
+        fps = probe(original)["fps"]
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-stats",
+        "-i",
+        str(original),
+        "-i",
+        str(mask_video),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[out]",
+    ]
+
+    if keep_audio:
+        cmd += ["-map", "0:a?", "-c:a", "libopus"]
+
+    cmd += [
+        "-r",
+        f"{fps:.6f}",
+        "-fps_mode",
+        "cfr",
+        "-c:v",
+        "libvpx-vp9",
+        "-pix_fmt",
+        "yuva420p",
+        "-b:v",
+        "2M",
+        "-auto-alt-ref",
+        "0",
+        str(output),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def compose_preview(
+    original: Path,
+    mask_video: Path,
+    output: Path,
+    *,
+    fps: float | None = None,
+) -> None:
+    """Generate a quick side-by-side preview: original left, red mask overlay right.
+
+    Uses fast H.264 encoding at reduced quality for quick iteration.
+    """
+    ffmpeg = _require_ffmpeg()
+
+    if fps is None:
+        fps = probe(original)["fps"]
+
+    # Overlay mask as semi-transparent red on original, stack horizontally.
+    filter_complex = (
+        "[0:v]setpts=PTS-STARTPTS[v];"
+        "[1:v]setpts=PTS-STARTPTS[mraw];"
+        "[mraw][v]scale2ref=flags=neighbor[m][vref];"
+        # Create red overlay from mask.
+        "[m]format=gray,colorize=hue=0:saturation=1:lightness=0.5[red];"
+        "[vref][red]overlay=format=auto:alpha=premultiplied[overlaid];"
+        "[v][overlaid]hstack[out]"
+    )
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(original),
+        "-i",
+        str(mask_video),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[out]",
+        "-r",
+        f"{fps:.6f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "28",
+        str(output),
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def extract_mask_frames(mask_video: Path, out_dir: Path) -> int:
     """Decode a mask mp4 to PNG-seq for `--format png-seq` output.
 
@@ -180,6 +334,10 @@ def compose_rgba_png_sequence(
     out_dir: Path,
     *,
     feather: int = 0,
+    dilate: int = 0,
+    erode: int = 0,
+    threshold: int = 0,
+    invert: bool = False,
 ) -> int:
     """Write RGBA PNGs (rgba_00000000.png …) by extracting frames from the
     alphamerge'd output. Returns frame count.
@@ -187,14 +345,13 @@ def compose_rgba_png_sequence(
     ffmpeg = _require_ffmpeg()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    feather_step = (
-        f",gblur=sigma={feather / 2:.3f}" if feather > 0 else ""
-    )
+    mask_filter = _build_mask_filter(feather, dilate, erode, threshold, invert)
+
     filter_complex = (
         f"[0:v]setpts=PTS-STARTPTS[vref];"
         f"[1:v]setpts=PTS-STARTPTS[mref];"
         f"[mref][vref]scale2ref=flags=neighbor[m0][v];"
-        f"[m0]format=gray{feather_step}[m];"
+        f"[m0]{mask_filter}[m];"
         f"[v][m]alphamerge,format=rgba[out]"
     )
 
@@ -204,6 +361,7 @@ def compose_rgba_png_sequence(
             "-y",
             "-loglevel",
             "error",
+            "-stats",
             "-i",
             str(original),
             "-i",
