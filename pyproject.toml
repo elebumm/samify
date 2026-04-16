@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "samify"
+version = "0.2.0"
+description = "Text-prompted video segmentation CLI — SAM 3 via cloud API (Replicate/fal.ai) or local GPU, output ProRes 4444 RGBA."
+requires-python = ">=3.10"
+readme = "README.md"
+# Core deps = cloud-only path. Local SAM 3 requires the [local] extra.
+dependencies = [
+    "replicate>=1.0",
+    "requests>=2.31",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+fal = ["fal-client>=0.5", "pycocotools>=2.0", "numpy>=1.26"]
+local = [
+    # torch / torchvision are installed separately for Blackwell (cu128) — see README.
+    "transformers>=4.57",   # SAM 3 landed in transformers 4.57
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "imageio>=2.34",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.scripts]
+samify = "samify.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["samify*"]
