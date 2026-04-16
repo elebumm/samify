@@ -12,6 +12,8 @@ from pathlib import Path
 
 import requests
 
+from samify.backends import SegmentResult
+
 # Pinned version (as of April 2026). Kept as a module constant so it's easy
 # to bump and audit. Override per-invocation with --model-version.
 DEFAULT_VERSION = (
@@ -33,7 +35,7 @@ class ReplicateBackend:
         model_version: str | None = None,
         poll_interval: float = 2.0,
         **_ignored,
-    ) -> Path:
+    ) -> SegmentResult:
         if not os.environ.get("REPLICATE_API_TOKEN"):
             raise RuntimeError(
                 "REPLICATE_API_TOKEN not set. Get a token from "
@@ -73,7 +75,8 @@ class ReplicateBackend:
         last_status = None
         while prediction.status not in ("succeeded", "failed", "canceled"):
             if prediction.status != last_status:
-                _log(f"  status: {prediction.status}")
+                elapsed = time.time() - t0
+                _log(f"  status: {prediction.status} ({elapsed:.0f}s elapsed)")
                 last_status = prediction.status
             time.sleep(poll_interval)
             prediction.reload()
@@ -91,17 +94,35 @@ class ReplicateBackend:
 
         mask_path = work_dir / "mask.mp4"
         _download(mask_url, mask_path)
-        return mask_path
+        # Replicate returns a ready-made mask mp4; we don't have per-frame stats.
+        return SegmentResult(mask_video=mask_path)
+
+    @staticmethod
+    def estimate_cost(n_frames: int, fps: float) -> dict[str, str | float]:
+        duration = n_frames / fps if fps else 0
+        cost = duration * 0.006  # ~$0.06 per 10s
+        est_time = duration * 6.7  # ~6.7x realtime based on benchmarks
+        return {
+            "backend": "Replicate (SAM 3)",
+            "cost": cost,
+            "cost_str": f"~${cost:.2f}",
+            "time_str": f"~{est_time:.0f}s",
+        }
 
 
 def _download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+                    downloaded += len(chunk)
+        if total:
+            _log(f"  downloaded {downloaded / (1024*1024):.1f} MB")
 
 
 def _log(msg: str) -> None:

@@ -1,16 +1,29 @@
 """Segmentation backends.
 
-Every backend implements `segment(input_video, prompt, work_dir, **opts) -> Path`
-and returns the path to a B/W mask-only mp4 that matches the input's frame
-count and framerate. The caller (`cli.py`) then composites the mask against
-the original via `video_io.compose_rgba_mov` — shared across all backends.
+Every backend implements `segment(input_video, prompt, work_dir, **opts) -> SegmentResult`
+and returns a SegmentResult containing the path to a B/W mask-only mp4 that
+matches the input's frame count and framerate, plus detection statistics.
+The caller (`cli.py`) then composites the mask against the original via
+`video_io.compose_rgba_mov` — shared across all backends.
 """
 from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+
+@dataclass
+class SegmentResult:
+    """Return value from Backend.segment()."""
+
+    mask_video: Path
+    total_frames: int = 0
+    detected_frames: int = 0
+    # Ranges of empty frames as (start_frame, end_frame) inclusive.
+    empty_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 class Backend(Protocol):
@@ -24,9 +37,14 @@ class Backend(Protocol):
         work_dir: Path,
         negative_prompt: str | None = None,
         **kwargs,
-    ) -> Path:
-        """Produce a B/W mask-only mp4. Return its path."""
+    ) -> SegmentResult:
+        """Produce a B/W mask-only mp4. Return a SegmentResult."""
         ...
+
+    @staticmethod
+    def estimate_cost(n_frames: int, fps: float) -> dict[str, str | float] | None:
+        """Return cost/time estimates, or None if not applicable."""
+        return None
 
 
 def available() -> list[str]:
@@ -37,8 +55,8 @@ def resolve(name: str | None = None) -> Backend:
     """Pick a backend.
 
     Explicit name wins. Otherwise auto-detect by env var:
+      FAL_KEY             -> fal  (SAM 3.1, recommended)
       REPLICATE_API_TOKEN -> replicate
-      FAL_KEY             -> fal
       (else)              -> error asking the user to pick
     """
     if name is None:

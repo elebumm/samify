@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+from samify.backends import SegmentResult
+
 DEFAULT_MODEL = "fal-ai/sam-3-1/video-rle"
 
 
@@ -38,7 +40,7 @@ class FalBackend:
         detection_threshold: float = 0.5,
         model: str | None = None,
         **_ignored,
-    ) -> Path:
+    ) -> SegmentResult:
         if not os.environ.get("FAL_KEY"):
             raise RuntimeError(
                 "FAL_KEY not set. Get a key from https://fal.ai/dashboard/keys."
@@ -52,6 +54,7 @@ class FalBackend:
         import fal_client
         import numpy as np
         from PIL import Image
+        from tqdm import tqdm
 
         model_id = model or DEFAULT_MODEL
         width, height = _probe_dims(input_video)
@@ -74,7 +77,8 @@ class FalBackend:
         for event in handler.iter_events(with_logs=False):
             status = type(event).__name__
             if status != last_status:
-                _log(f"  status: {status}")
+                elapsed = time.time() - t0
+                _log(f"  status: {status} ({elapsed:.0f}s elapsed)")
                 last_status = status
         result = handler.get()
         _log(f"  finished in {time.time() - t0:.1f}s")
@@ -82,25 +86,63 @@ class FalBackend:
         rle_list = result.get("rle") or []
         if not isinstance(rle_list, list):
             rle_list = [rle_list]
-        _log(f"  got {len(rle_list)} frame(s) of RLE; decoding to mask video…")
+        total_frames = len(rle_list)
+        _log(f"  got {total_frames} frame(s) of RLE; decoding to mask video…")
 
         # Decode every frame.  Empty / None RLE -> black frame (subject missing).
         masks_dir = work_dir / "mask_frames"
         masks_dir.mkdir(parents=True, exist_ok=True)
         empty_frames = 0
-        for i, frame_rle in enumerate(rle_list):
+        empty_ranges: list[tuple[int, int]] = []
+        in_empty_run = False
+        empty_run_start = 0
+
+        for i, frame_rle in enumerate(
+            tqdm(rle_list, desc="Decoding masks", unit="frame", file=sys.stderr)
+        ):
             if not frame_rle:
                 mask = np.zeros((height, width), dtype=np.uint8)
                 empty_frames += 1
+                if not in_empty_run:
+                    in_empty_run = True
+                    empty_run_start = i
             else:
                 mask = _decode_uncompressed_rle(frame_rle, width, height)
+                if mask.max() == 0:
+                    empty_frames += 1
+                    if not in_empty_run:
+                        in_empty_run = True
+                        empty_run_start = i
+                else:
+                    if in_empty_run:
+                        empty_ranges.append((empty_run_start, i - 1))
+                        in_empty_run = False
             Image.fromarray(mask, mode="L").save(masks_dir / f"{i:08d}.png")
-        if empty_frames:
-            _log(f"  {empty_frames} frames had no detection (black masks)")
+
+        if in_empty_run:
+            empty_ranges.append((empty_run_start, total_frames - 1))
 
         mask_video = work_dir / "mask.mp4"
         _encode_mask_video(masks_dir, mask_video, fps)
-        return mask_video
+        return SegmentResult(
+            mask_video=mask_video,
+            total_frames=total_frames,
+            detected_frames=total_frames - empty_frames,
+            empty_ranges=empty_ranges,
+        )
+
+    @staticmethod
+    def estimate_cost(n_frames: int, fps: float) -> dict[str, str | float]:
+        chunks = (n_frames + 15) // 16
+        cost = chunks * 0.01
+        duration = n_frames / fps if fps else 0
+        est_time = duration * 3.3  # ~3.3x realtime based on benchmarks
+        return {
+            "backend": "fal.ai (SAM 3.1)",
+            "cost": cost,
+            "cost_str": f"~${cost:.2f} ({chunks} chunks @ $0.01/16 frames)",
+            "time_str": f"~{est_time:.0f}s",
+        }
 
 
 def _decode_uncompressed_rle(rle_str: str, width: int, height: int) -> "any":
